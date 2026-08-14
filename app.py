@@ -1,6 +1,7 @@
 import io
 import re
 import zipfile
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -39,6 +40,21 @@ def classify(text_lower):
 def _safe_float(text):
     match = re.search(r"[-+]?\d*\.?\d+", text)
     return float(match.group()) if match else None
+
+
+def sanitize_tag(text):
+    """แปลงข้อความที่ผู้ใช้พิมพ์ให้เป็นคำต่อท้ายชื่อไฟล์ที่ปลอดภัย (ตัดอักขระที่ Windows/Excel ใช้ไม่ได้)."""
+    text = (text or "").strip()
+    text = re.sub(r'[\\/:*?"<>|]+', "_", text)
+    text = re.sub(r"\s+", "_", text)
+    return text.strip("_")
+
+
+def apply_tag(filename, tag):
+    if not tag:
+        return filename
+    stem, ext = filename.rsplit(".", 1)
+    return f"{stem}_{tag}.{ext}"
 
 
 def _parse_aqwa(file_bytes, filename):
@@ -294,7 +310,7 @@ def compute_steady_stats(df, present_cols, cutoff):
     return pd.DataFrame(stats_rows)
 
 
-def render_case(fname, result, key_suffix):
+def render_case(fname, result, key_suffix, tag=""):
     """แสดงกราฟ/สถิติ/ปุ่มดาวน์โหลดสำหรับไฟล์เคสเดียว (เรียกซ้ำได้หลายครั้งเมื่ออัปโหลดหลายไฟล์)."""
     df = result["df"]
     condition_text = result["condition_text"]
@@ -460,14 +476,14 @@ def render_case(fname, result, key_suffix):
     st.download_button(
         label="💾 Download Results (.xlsx)",
         data=excel_bytes,
-        file_name=result["dl_filename"],
+        file_name=apply_tag(result["dl_filename"], tag),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         key=f"download_{key_suffix}",
     )
 
 
-def render_comparison(cases):
+def render_comparison(cases, tag=""):
     """สรุปเปรียบเทียบทุกเคส (หลาย H/T) ในตารางและกราฟเดียว ใช้ cutoff เดียวกันทุกเคสเพื่อให้เทียบกันได้จริง"""
     st.markdown("---")
     st.subheader("🧮 เปรียบเทียบทุกเคส (Comparison Across Cases)")
@@ -536,11 +552,12 @@ def render_comparison(cases):
         )
         st.plotly_chart(fig, use_container_width=True, key="comparison_rao_chart")
 
+    summary_csv_name = apply_tag("AQWA_Comparison_Summary.csv", tag)
     col_a, col_b = st.columns(2)
     col_a.download_button(
         "💾 Download Comparison Summary (.csv)",
         data=df_summary.to_csv(index=False).encode("utf-8-sig"),
-        file_name="AQWA_Comparison_Summary.csv",
+        file_name=summary_csv_name,
         mime="text/csv",
         key="download_comparison",
     )
@@ -548,8 +565,9 @@ def render_comparison(cases):
     zip_buffer = io.BytesIO()
     used_names = set()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("AQWA_Comparison_Summary.csv", df_summary.to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr(summary_csv_name, df_summary.to_csv(index=False).encode("utf-8-sig"))
         for dl_filename, excel_bytes in case_excels:
+            dl_filename = apply_tag(dl_filename, tag)
             name = dl_filename
             n = 2
             while name in used_names:
@@ -562,34 +580,119 @@ def render_comparison(cases):
     col_b.download_button(
         f"📦 Download All {len(case_excels)} Cases (.zip)",
         data=zip_buffer.getvalue(),
-        file_name="AQWA_All_Cases.zip",
+        file_name=apply_tag("AQWA_All_Cases.zip", tag),
         mime="application/zip",
         key="download_all_zip",
         type="primary",
     )
 
 
+def _extract_csvs_from_zip(zip_bytes, zip_label):
+    """แตกไฟล์ .csv ทั้งหมดออกจาก .zip (รองรับโฟลเดอร์ซ้อนในไฟล์ zip) -> [(name, bytes), ...]"""
+    extracted = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            base = info.filename.rsplit("/", 1)[-1]
+            if not base.lower().endswith(".csv") or base.startswith("._") or "__MACOSX" in info.filename:
+                continue
+            extracted.append((f"{zip_label}/{info.filename}", zf.read(info.filename)))
+    return extracted
+
+
+def _collect_local_folder_csvs(folder_path, recursive):
+    """อ่านไฟล์ .csv ทั้งหมดจากโฟลเดอร์บนเครื่องที่รันแอปอยู่ -> [(name, bytes), ...] (ใช้ได้เฉพาะตอนรัน local)"""
+    root = Path(folder_path)
+    pattern = "**/*.csv" if recursive else "*.csv"
+    collected = []
+    for p in sorted(root.glob(pattern)):
+        if p.is_file():
+            collected.append((str(p.relative_to(root)).replace("\\", "/"), p.read_bytes()))
+    return collected
+
+
+def _dedupe_name(name, used_names):
+    if name not in used_names:
+        used_names.add(name)
+        return name
+    stem, ext = (name.rsplit(".", 1) + [""])[:2]
+    n = 2
+    candidate = f"{stem}_{n}.{ext}" if ext else f"{stem}_{n}"
+    while candidate in used_names:
+        n += 1
+        candidate = f"{stem}_{n}.{ext}" if ext else f"{stem}_{n}"
+    used_names.add(candidate)
+    return candidate
+
+
 st.title("🌊 AQWA Wave Analyzer")
 st.markdown(
-    "อัปโหลดไฟล์ CSV จาก AQWA ได้ทีละหลายไฟล์ (รองรับไฟล์ Raw โดยตรง รวมถึงเคสที่มีเส้นสมอหลายเส้น หรือมีแค่บางตัวแปร) "
+    "อัปโหลดไฟล์ CSV จาก AQWA ได้ทีละหลายไฟล์ หรือทั้งโฟลเดอร์ในครั้งเดียวโดยบีบอัดเป็น .zip ก่อนอัปโหลด "
+    "(รองรับไฟล์ Raw โดยตรง รวมถึงเคสที่มีเส้นสมอหลายเส้น หรือมีแค่บางตัวแปร) "
     "โปรแกรมจะสร้างกราฟแบบ Interactive พร้อมสรุปสถิติ/RAO ต่อเคส และเปรียบเทียบข้ามเคส (หลายความสูงคลื่น/คาบ) ส่งออกเป็น Excel/CSV ได้"
 )
 
 uploaded_files = st.file_uploader(
-    "📥 อัปโหลดไฟล์ CSV ของคุณ (เลือกได้หลายไฟล์พร้อมกัน)",
-    accept_multiple_files=True, type=["csv"],
+    "📥 อัปโหลดไฟล์ CSV หรือ .zip ของทั้งโฟลเดอร์ (เลือก/ลากมาได้หลายไฟล์พร้อมกัน)",
+    accept_multiple_files=True, type=["csv", "zip"],
 )
 
-if uploaded_files:
-    cases = []
-    for f in uploaded_files:
-        with st.spinner(f"กำลังอ่านและประมวลผลไฟล์ {f.name} ..."):
+with st.expander("📁 หรือโหลดจากโฟลเดอร์บนเครื่องนี้ (ใช้ได้เฉพาะตอนรันแอปแบบ local เท่านั้น — ใช้ไม่ได้กับแอปเวอร์ชันที่ deploy บน Streamlit Cloud)"):
+    col_path, col_opt = st.columns([4, 1])
+    folder_path_input = col_path.text_input(
+        "พาธโฟลเดอร์ เช่น D:\\EGAT\\awqa_dam\\aqwa_dam2\\bmb\\Max", key="folder_path_input"
+    )
+    recursive_scan = col_opt.checkbox("รวมโฟลเดอร์ย่อย", value=True, key="folder_recursive")
+    if st.button("📂 โหลดไฟล์ CSV จากโฟลเดอร์นี้"):
+        folder = Path(folder_path_input) if folder_path_input else None
+        if not folder_path_input:
+            st.warning("กรุณาระบุพาธโฟลเดอร์ก่อน")
+        elif not folder.is_dir():
+            st.error(f"⚠️ ไม่พบโฟลเดอร์: {folder_path_input}")
+        else:
+            loaded = _collect_local_folder_csvs(folder, recursive_scan)
+            if not loaded:
+                st.warning("ไม่พบไฟล์ .csv ในโฟลเดอร์นี้")
+            st.session_state["local_folder_files"] = loaded
+            st.session_state["local_folder_path"] = folder_path_input
+    local_loaded = st.session_state.get("local_folder_files") or []
+    if local_loaded:
+        st.success(f"โหลดแล้ว {len(local_loaded)} ไฟล์จาก: {st.session_state.get('local_folder_path')}")
+        if st.button("❌ ล้างไฟล์ที่โหลดจากโฟลเดอร์"):
+            st.session_state["local_folder_files"] = []
+            st.rerun()
+
+file_tag = sanitize_tag(st.text_input(
+    "🏷️ ป้ายต่อท้ายชื่อไฟล์ส่งออก (เช่น ชื่อสถานี, ความลึก) — ไม่บังคับ",
+    placeholder="เช่น pmp_95.14m หรือ snr",
+    key="export_file_tag",
+))
+
+raw_sources = []
+for f in uploaded_files or []:
+    if f.name.lower().endswith(".zip"):
+        with st.spinner(f"กำลังแตกไฟล์ .csv จาก {f.name} ..."):
             try:
-                result = parse_aqwa_file(f.getvalue(), f.name)
+                raw_sources.extend(_extract_csvs_from_zip(f.getvalue(), f.name.rsplit(".", 1)[0]))
+            except zipfile.BadZipFile:
+                st.error(f"⚠️ {f.name}: ไม่ใช่ไฟล์ .zip ที่ถูกต้อง")
+    else:
+        raw_sources.append((f.name, f.getvalue()))
+raw_sources.extend(st.session_state.get("local_folder_files") or [])
+
+if raw_sources:
+    used_names = set()
+    cases = []
+    for name, file_bytes in raw_sources:
+        display_name = _dedupe_name(name, used_names)
+        with st.spinner(f"กำลังอ่านและประมวลผลไฟล์ {display_name} ..."):
+            try:
+                result = parse_aqwa_file(file_bytes, display_name)
             except Exception as e:
-                st.error(f"⚠️ {f.name}: เกิดข้อผิดพลาดในการอ่านไฟล์ - {e}")
+                st.error(f"⚠️ {display_name}: เกิดข้อผิดพลาดในการอ่านไฟล์ - {e}")
                 continue
-        cases.append((f.name, result))
+        cases.append((display_name, result))
 
     if not cases:
         st.stop()
@@ -601,13 +704,13 @@ if uploaded_files:
     ))
 
     if len(cases) > 1:
-        render_comparison(cases)
+        render_comparison(cases, tag=file_tag)
         st.markdown("---")
         st.subheader("📂 รายละเอียดแต่ละเคส")
         tabs = st.tabs([fname for fname, _ in cases])
         for tab, (fname, result) in zip(tabs, cases):
             with tab:
-                render_case(fname, result, key_suffix=fname)
+                render_case(fname, result, key_suffix=fname, tag=file_tag)
     else:
         fname, result = cases[0]
-        render_case(fname, result, key_suffix=fname)
+        render_case(fname, result, key_suffix=fname, tag=file_tag)
