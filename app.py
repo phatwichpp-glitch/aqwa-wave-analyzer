@@ -125,11 +125,12 @@ def _parse_aqwa(file_bytes, filename):
         condition_text = f"(Condition: H={h_val}, T={t_val})"
         sheet_data, sheet_plot = f"Data_{h_val}_{t_val}", f"Plot_{h_val}_{t_val}"
         dl_filename = f"AQWA_Result_{h_val}_{t_val}.xlsx"
-        h_value = _safe_float(h_val)
+        h_value, t_value = _safe_float(h_val), _safe_float(t_val)
     else:
+        h_val = t_val = None
         condition_text, sheet_data, sheet_plot = "", "Data", "Plots"
         dl_filename = f"AQWA_Analysis_{stem}.xlsx"
-        h_value = None
+        h_value = t_value = None
 
     return {
         "df": df_merged,
@@ -137,7 +138,10 @@ def _parse_aqwa(file_bytes, filename):
         "sheet_data": sheet_data,
         "sheet_plot": sheet_plot,
         "dl_filename": dl_filename,
+        "h_val": h_val,
+        "t_val": t_val,
         "h_value": h_value,
+        "t_value": t_value,
         "rename_report": rename_report,
         "rows_before": rows_before,
         "rows_after": rows_after,
@@ -272,197 +276,303 @@ def build_excel_bytes(df, df_stats, condition_text, sheet_data, sheet_plot, has_
     return output.getvalue()
 
 
-st.title("🌊 AQWA Wave Analyzer")
-st.markdown(
-    "อัปโหลดไฟล์ CSV จาก AQWA (รองรับไฟล์ Raw โดยตรง รวมถึงเคสที่มีเส้นสมอหลายเส้น หรือมีแค่บางตัวแปร) "
-    "โปรแกรมจะสร้างกราฟแบบ Interactive พร้อมสรุปสถิติ/RAO และส่งออกเป็น Excel"
-)
+def compute_steady_stats(df, present_cols, cutoff):
+    df_steady = df[df["Time_s"] > cutoff]
+    if df_steady.empty:
+        return pd.DataFrame()
+    stats_rows = []
+    for col in present_cols:
+        series = df_steady[col].dropna()
+        if series.empty:
+            continue
+        vmax, vmin = series.max(), series.min()
+        stats_rows.append({
+            "Parameter": col, "Max": vmax, "Min": vmin,
+            "Amplitude": (vmax - vmin) / 2, "Mean": series.mean(),
+        })
+    return pd.DataFrame(stats_rows)
 
-uploaded_file = st.file_uploader("📥 อัปโหลดไฟล์ CSV ของคุณ", accept_multiple_files=False, type=["csv"])
 
-if uploaded_file:
-    with st.spinner("กำลังอ่านและประมวลผลไฟล์..."):
-        try:
-            result = parse_aqwa_file(uploaded_file.getvalue(), uploaded_file.name)
-        except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดในการอ่านไฟล์: {e}")
-            st.stop()
-
+def render_case(fname, result, key_suffix):
+    """แสดงกราฟ/สถิติ/ปุ่มดาวน์โหลดสำหรับไฟล์เคสเดียว (เรียกซ้ำได้หลายครั้งเมื่ออัปโหลดหลายไฟล์)."""
     df = result["df"]
     condition_text = result["condition_text"]
     present_cols = [c for c in df.columns if c != "Time_s"]
 
     if "Time_s" not in df.columns or df.empty:
         st.error("⚠️ ไม่พบคอลัมน์เวลา (Time) หรือไม่มีข้อมูลที่อ่านได้ในไฟล์นี้")
-    elif not present_cols:
+        return
+    if not present_cols:
         st.error("⚠️ อ่านไฟล์ได้ แต่ไม่พบตัวแปรที่รู้จัก (Wave/Heave/Tension/RX/RY/RZ)")
         st.info("ลองตรวจสอบ Metadata header ในไฟล์ต้นฉบับ (บรรทัด 'Line X: ...' ที่อธิบายว่าแต่ละ Line คือตัวแปรอะไร)")
+        return
+
+    st.success(f"✅ อ่านไฟล์และจัดเรียงข้อมูลสำเร็จ! {condition_text}")
+
+    unmatched = [c for c, cat in result["rename_report"] if cat is None]
+    dropped = result["rows_before"] - result["rows_after"]
+    with st.expander("🔍 รายละเอียดการอ่านไฟล์ (Column Mapping / Data Quality)"):
+        st.write("**คอลัมน์ที่จับคู่ได้:**")
+        st.table(pd.DataFrame(
+            [(c, cat) for c, cat in result["rename_report"] if cat],
+            columns=["Raw Column", "Mapped To"],
+        ))
+        if unmatched:
+            st.warning(f"คอลัมน์ที่จับคู่ไม่ได้ ({len(unmatched)}): {', '.join(unmatched)}")
+        if dropped > 0:
+            st.warning(f"ทิ้งไป {dropped} แถว เนื่องจากอ่านค่าเวลา (Time) ไม่ได้ (แถวว่าง/ท้ายไฟล์)")
+        if result["nan_counts"]:
+            st.warning(
+                f"พบค่าว่าง/อ่านไม่ได้บางจุดในคอลัมน์: {result['nan_counts']} "
+                "(จุดเหล่านี้จะแสดงเป็นช่องว่างในกราฟ ไม่ถูกลบทิ้งทั้งแถว)"
+            )
+        st.write("**ตัวอย่างข้อมูลดิบ (20 แถวแรกหลังตัด Header):**")
+        st.dataframe(result["raw_preview"], use_container_width=True)
+
+    tension_cols = [c for c in df.columns if c.startswith("Tension")]
+    rot_cols = [c for c in ["RX_deg", "RY_deg", "RZ_deg"] if c in df.columns]
+    has_wave, has_heave = "Wave_m" in df.columns, "Heave_m" in df.columns
+
+    # ==========================================
+    # กราฟ Interactive (Plotly)
+    # ==========================================
+    st.subheader("📈 กราฟวิเคราะห์ผล (Interactive Plots)")
+
+    if has_wave and has_heave:
+        (wlo, whi), (hlo, hhi) = compute_matched_ylim(df["Wave_m"].dropna(), df["Heave_m"].dropna())
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Scatter(x=df["Time_s"], y=df["Wave_m"], name="Wave Elevation",
+                                  line=dict(color=COLOR_MAP["Wave_m"])), secondary_y=False)
+        fig.add_trace(go.Scatter(x=df["Time_s"], y=df["Heave_m"], name="Heave Response",
+                                  line=dict(color=COLOR_MAP["Heave_m"])), secondary_y=True)
+        fig.update_yaxes(title_text="Wave (m)", range=[wlo, whi], secondary_y=False)
+        fig.update_yaxes(title_text="Heave (m)", range=[hlo, hhi], secondary_y=True)
+        fig.update_xaxes(title_text="Time (s)")
+        fig.update_layout(
+            title=f"Buoy Heave vs Wave Elevation (Dual Axis)<br><sup>{condition_text}</sup>",
+            height=420, hovermode="x unified",
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"dual_{key_suffix}")
+
+        st.plotly_chart(
+            line_chart(df, ["Wave_m", "Heave_m"], [COLOR_MAP["Wave_m"], COLOR_MAP["Heave_m"]],
+                       "Buoy Heave vs Wave Elevation (Single Y-Axis)", "Elevation (m)", condition_text),
+            use_container_width=True, key=f"single_{key_suffix}",
+        )
+    elif has_wave:
+        st.plotly_chart(
+            line_chart(df, ["Wave_m"], [COLOR_MAP["Wave_m"]], "Wave Elevation", "Wave (m)", condition_text),
+            use_container_width=True, key=f"wave_{key_suffix}",
+        )
+    elif has_heave:
+        st.plotly_chart(
+            line_chart(df, ["Heave_m"], [COLOR_MAP["Heave_m"]], "Heave Response", "Heave (m)", condition_text),
+            use_container_width=True, key=f"heave_{key_suffix}",
+        )
+
+    if tension_cols:
+        st.plotly_chart(
+            line_chart(df, tension_cols, TENSION_COLORS[: len(tension_cols)],
+                       "Mooring Line Tension", "Tension (kN)", condition_text),
+            use_container_width=True, key=f"tension_{key_suffix}",
+        )
+
+    if len(rot_cols) >= 2:
+        st.plotly_chart(
+            line_chart(df, rot_cols, [COLOR_MAP[c] for c in rot_cols],
+                       "Rotational Response (Combined)", "Rotation (deg)", condition_text),
+            use_container_width=True, key=f"rot_combined_{key_suffix}",
+        )
+
+    if "RX_deg" in df.columns and "RY_deg" in df.columns:
+        st.plotly_chart(
+            line_chart(df, ["RX_deg", "RY_deg"], [COLOR_MAP["RX_deg"], COLOR_MAP["RY_deg"]],
+                       "Rotational Response: RX vs RY", "Rotation (deg)", condition_text),
+            use_container_width=True, key=f"rxry_{key_suffix}",
+        )
+    elif len(rot_cols) == 1:
+        c = rot_cols[0]
+        st.plotly_chart(
+            line_chart(df, [c], [COLOR_MAP[c]], f"Rotational Response ({c})", "Rotation (deg)", condition_text),
+            use_container_width=True, key=f"rot_single_{key_suffix}",
+        )
+
+    if rot_cols:
+        st.markdown("##### กราฟแยกทีละแกน (Separated Axes)")
+        fig = make_subplots(rows=len(rot_cols), cols=1, shared_xaxes=True, subplot_titles=rot_cols)
+        for i, c in enumerate(rot_cols, start=1):
+            fig.add_trace(go.Scatter(x=df["Time_s"], y=df[c], name=c, line=dict(color=COLOR_MAP[c])),
+                          row=i, col=1)
+        fig.update_xaxes(title_text="Time (s)", row=len(rot_cols), col=1)
+        fig.update_layout(
+            height=280 * len(rot_cols),
+            title=f"Rotational Response (Separated)<br><sup>{condition_text}</sup>",
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"rot_sep_{key_suffix}")
+
+    # ==========================================
+    # สรุปสถิติ & RAO (Steady-State Analysis)
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📐 สรุปผลสถิติ & RAO (Steady-State Analysis)")
+
+    t_min, t_max = float(df["Time_s"].min()), float(df["Time_s"].max())
+    default_cutoff = min(50.0, t_max) if t_max > t_min else t_min
+    cutoff = st.slider(
+        "ตัดช่วง Transient เริ่มต้น (คำนวณสถิติ/RAO จากข้อมูลหลังวินาทีที่เลือกเท่านั้น)",
+        min_value=t_min, max_value=t_max, value=default_cutoff,
+        step=max((t_max - t_min) / 100, 0.1) if t_max > t_min else 1.0,
+        key=f"cutoff_{key_suffix}",
+    )
+
+    df_stats = compute_steady_stats(df, present_cols, cutoff)
+    if df_stats.empty:
+        st.warning("ไม่มีข้อมูลเหลือหลังตัด Transient ลองปรับค่าลง")
     else:
-        st.success(f"✅ อ่านไฟล์และจัดเรียงข้อมูลสำเร็จ! {condition_text}")
-
-        unmatched = [c for c, cat in result["rename_report"] if cat is None]
-        dropped = result["rows_before"] - result["rows_after"]
-        with st.expander("🔍 รายละเอียดการอ่านไฟล์ (Column Mapping / Data Quality)"):
-            st.write("**คอลัมน์ที่จับคู่ได้:**")
-            st.table(pd.DataFrame(
-                [(c, cat) for c, cat in result["rename_report"] if cat],
-                columns=["Raw Column", "Mapped To"],
-            ))
-            if unmatched:
-                st.warning(f"คอลัมน์ที่จับคู่ไม่ได้ ({len(unmatched)}): {', '.join(unmatched)}")
-            if dropped > 0:
-                st.warning(f"ทิ้งไป {dropped} แถว เนื่องจากอ่านค่าเวลา (Time) ไม่ได้ (แถวว่าง/ท้ายไฟล์)")
-            if result["nan_counts"]:
-                st.warning(
-                    f"พบค่าว่าง/อ่านไม่ได้บางจุดในคอลัมน์: {result['nan_counts']} "
-                    "(จุดเหล่านี้จะแสดงเป็นช่องว่างในกราฟ ไม่ถูกลบทิ้งทั้งแถว)"
-                )
-            st.write("**ตัวอย่างข้อมูลดิบ (20 แถวแรกหลังตัด Header):**")
-            st.dataframe(result["raw_preview"], use_container_width=True)
-
-        tension_cols = [c for c in df.columns if c.startswith("Tension")]
-        rot_cols = [c for c in ["RX_deg", "RY_deg", "RZ_deg"] if c in df.columns]
-        has_wave, has_heave = "Wave_m" in df.columns, "Heave_m" in df.columns
-
-        # ==========================================
-        # กราฟ Interactive (Plotly)
-        # ==========================================
-        st.subheader("📈 กราฟวิเคราะห์ผล (Interactive Plots)")
-
         if has_wave and has_heave:
-            (wlo, whi), (hlo, hhi) = compute_matched_ylim(df["Wave_m"].dropna(), df["Heave_m"].dropna())
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.add_trace(go.Scatter(x=df["Time_s"], y=df["Wave_m"], name="Wave Elevation",
-                                      line=dict(color=COLOR_MAP["Wave_m"])), secondary_y=False)
-            fig.add_trace(go.Scatter(x=df["Time_s"], y=df["Heave_m"], name="Heave Response",
-                                      line=dict(color=COLOR_MAP["Heave_m"])), secondary_y=True)
-            fig.update_yaxes(title_text="Wave (m)", range=[wlo, whi], secondary_y=False)
-            fig.update_yaxes(title_text="Heave (m)", range=[hlo, hhi], secondary_y=True)
-            fig.update_xaxes(title_text="Time (s)")
-            fig.update_layout(
-                title=f"Buoy Heave vs Wave Elevation (Dual Axis)<br><sup>{condition_text}</sup>",
-                height=420, hovermode="x unified",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            wave_amp = df_stats.loc[df_stats["Parameter"] == "Wave_m", "Amplitude"]
+            heave_amp = df_stats.loc[df_stats["Parameter"] == "Heave_m", "Amplitude"]
+            if len(wave_amp) and len(heave_amp) and wave_amp.iloc[0] != 0:
+                rao = heave_amp.iloc[0] / wave_amp.iloc[0]
+                col_a, col_b = st.columns(2)
+                col_a.metric("RAO (Heave/Wave)", f"{rao:.3f}")
+                if result["h_value"] and heave_amp.iloc[0] != 0:
+                    hs_ratio = result["h_value"] / heave_amp.iloc[0]
+                    col_b.metric("Hs / Heave Amplitude", f"{hs_ratio:.3f}")
 
-            st.plotly_chart(
-                line_chart(df, ["Wave_m", "Heave_m"], [COLOR_MAP["Wave_m"], COLOR_MAP["Heave_m"]],
-                           "Buoy Heave vs Wave Elevation (Single Y-Axis)", "Elevation (m)", condition_text),
-                use_container_width=True,
-            )
-        elif has_wave:
-            st.plotly_chart(
-                line_chart(df, ["Wave_m"], [COLOR_MAP["Wave_m"]], "Wave Elevation", "Wave (m)", condition_text),
-                use_container_width=True,
-            )
-        elif has_heave:
-            st.plotly_chart(
-                line_chart(df, ["Heave_m"], [COLOR_MAP["Heave_m"]], "Heave Response", "Heave (m)", condition_text),
-                use_container_width=True,
-            )
+        st.dataframe(
+            df_stats.style.format({"Max": "{:.4f}", "Min": "{:.4f}", "Amplitude": "{:.4f}", "Mean": "{:.4f}"}),
+            use_container_width=True,
+        )
 
-        if tension_cols:
-            st.plotly_chart(
-                line_chart(df, tension_cols, TENSION_COLORS[: len(tension_cols)],
-                           "Mooring Line Tension", "Tension (kN)", condition_text),
-                use_container_width=True,
-            )
+    # ==========================================
+    # ส่งออก Excel
+    # ==========================================
+    st.markdown("---")
+    st.subheader("📥 ส่งออกข้อมูล (Export to Excel)")
 
-        if len(rot_cols) >= 2:
-            st.plotly_chart(
-                line_chart(df, rot_cols, [COLOR_MAP[c] for c in rot_cols],
-                           "Rotational Response (Combined)", "Rotation (deg)", condition_text),
-                use_container_width=True,
-            )
+    excel_bytes = build_excel_bytes(
+        df, df_stats, condition_text, result["sheet_data"], result["sheet_plot"],
+        has_wave, has_heave, tension_cols, rot_cols,
+    )
+    st.download_button(
+        label="💾 Download Results (.xlsx)",
+        data=excel_bytes,
+        file_name=result["dl_filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        key=f"download_{key_suffix}",
+    )
 
-        if "RX_deg" in df.columns and "RY_deg" in df.columns:
-            st.plotly_chart(
-                line_chart(df, ["RX_deg", "RY_deg"], [COLOR_MAP["RX_deg"], COLOR_MAP["RY_deg"]],
-                           "Rotational Response: RX vs RY", "Rotation (deg)", condition_text),
-                use_container_width=True,
-            )
-        elif len(rot_cols) == 1:
-            c = rot_cols[0]
-            st.plotly_chart(
-                line_chart(df, [c], [COLOR_MAP[c]], f"Rotational Response ({c})", "Rotation (deg)", condition_text),
-                use_container_width=True,
-            )
 
-        if rot_cols:
-            st.markdown("##### กราฟแยกทีละแกน (Separated Axes)")
-            fig = make_subplots(rows=len(rot_cols), cols=1, shared_xaxes=True, subplot_titles=rot_cols)
-            for i, c in enumerate(rot_cols, start=1):
-                fig.add_trace(go.Scatter(x=df["Time_s"], y=df[c], name=c, line=dict(color=COLOR_MAP[c])),
-                              row=i, col=1)
-            fig.update_xaxes(title_text="Time (s)", row=len(rot_cols), col=1)
-            fig.update_layout(
-                height=280 * len(rot_cols),
-                title=f"Rotational Response (Separated)<br><sup>{condition_text}</sup>",
-                showlegend=False,
-            )
-            st.plotly_chart(fig, use_container_width=True)
+def render_comparison(cases):
+    """สรุปเปรียบเทียบทุกเคส (หลาย H/T) ในตารางและกราฟเดียว ใช้ cutoff เดียวกันทุกเคสเพื่อให้เทียบกันได้จริง"""
+    st.markdown("---")
+    st.subheader("🧮 เปรียบเทียบทุกเคส (Comparison Across Cases)")
 
-        # ==========================================
-        # สรุปสถิติ & RAO (Steady-State Analysis)
-        # ==========================================
+    max_t = max(float(r["df"]["Time_s"].max()) for _, r in cases)
+    global_cutoff = st.number_input(
+        "ตัดช่วง Transient เริ่มต้น (วินาที) — ใช้ค่าเดียวกันทุกเคสเพื่อเปรียบเทียบอย่างเป็นธรรม",
+        min_value=0.0, max_value=max_t, value=min(50.0, max_t), step=5.0,
+    )
+
+    summary_rows = []
+    for fname, result in cases:
+        df = result["df"]
+        present_cols = [c for c in df.columns if c != "Time_s"]
+        df_stats = compute_steady_stats(df, present_cols, global_cutoff)
+        row = {
+            "File": fname,
+            "H": result["h_value"] if result["h_value"] is not None else result["h_val"],
+            "T": result["t_value"] if result["t_value"] is not None else result["t_val"],
+        }
+        amp_by_param = dict(zip(df_stats.get("Parameter", []), df_stats.get("Amplitude", [])))
+        max_by_param = dict(zip(df_stats.get("Parameter", []), df_stats.get("Max", [])))
+        if "Wave_m" in amp_by_param:
+            row["Wave Amp (m)"] = amp_by_param["Wave_m"]
+        if "Heave_m" in amp_by_param:
+            row["Heave Amp (m)"] = amp_by_param["Heave_m"]
+        if "Wave_m" in amp_by_param and "Heave_m" in amp_by_param and amp_by_param["Wave_m"]:
+            row["RAO (Heave/Wave)"] = amp_by_param["Heave_m"] / amp_by_param["Wave_m"]
+        for param, max_val in max_by_param.items():
+            if param.startswith("Tension"):
+                row[f"Max {param}"] = max_val
+        summary_rows.append(row)
+
+    df_summary = pd.DataFrame(summary_rows).sort_values(
+        by=[c for c in ["H", "T"] if c in summary_rows[0]] or ["File"], na_position="last"
+    ).reset_index(drop=True)
+
+    st.dataframe(
+        df_summary.style.format({c: "{:.4f}" for c in df_summary.columns if c not in ("File", "H", "T")}),
+        use_container_width=True,
+    )
+
+    if "RAO (Heave/Wave)" in df_summary.columns and df_summary["RAO (Heave/Wave)"].notna().any():
+        x_col = "T" if df_summary["T"].notna().any() else "File"
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df_summary[x_col], y=df_summary["RAO (Heave/Wave)"],
+            mode="lines+markers", name="RAO (Heave/Wave)",
+            line=dict(color=COLOR_MAP["Heave_m"]),
+        ))
+        fig.update_layout(
+            title="RAO (Heave/Wave) เทียบระหว่างเคส",
+            xaxis_title="Wave Period T (s)" if x_col == "T" else "File",
+            yaxis_title="RAO (Heave/Wave)",
+            height=380,
+        )
+        st.plotly_chart(fig, use_container_width=True, key="comparison_rao_chart")
+
+    st.download_button(
+        "💾 Download Comparison Summary (.csv)",
+        data=df_summary.to_csv(index=False).encode("utf-8-sig"),
+        file_name="AQWA_Comparison_Summary.csv",
+        mime="text/csv",
+        key="download_comparison",
+    )
+
+
+st.title("🌊 AQWA Wave Analyzer")
+st.markdown(
+    "อัปโหลดไฟล์ CSV จาก AQWA ได้ทีละหลายไฟล์ (รองรับไฟล์ Raw โดยตรง รวมถึงเคสที่มีเส้นสมอหลายเส้น หรือมีแค่บางตัวแปร) "
+    "โปรแกรมจะสร้างกราฟแบบ Interactive พร้อมสรุปสถิติ/RAO ต่อเคส และเปรียบเทียบข้ามเคส (หลายความสูงคลื่น/คาบ) ส่งออกเป็น Excel/CSV ได้"
+)
+
+uploaded_files = st.file_uploader(
+    "📥 อัปโหลดไฟล์ CSV ของคุณ (เลือกได้หลายไฟล์พร้อมกัน)",
+    accept_multiple_files=True, type=["csv"],
+)
+
+if uploaded_files:
+    cases = []
+    for f in uploaded_files:
+        with st.spinner(f"กำลังอ่านและประมวลผลไฟล์ {f.name} ..."):
+            try:
+                result = parse_aqwa_file(f.getvalue(), f.name)
+            except Exception as e:
+                st.error(f"⚠️ {f.name}: เกิดข้อผิดพลาดในการอ่านไฟล์ - {e}")
+                continue
+        cases.append((f.name, result))
+
+    if not cases:
+        st.stop()
+
+    cases.sort(key=lambda item: (
+        item[1]["h_value"] if item[1]["h_value"] is not None else float("inf"),
+        item[1]["t_value"] if item[1]["t_value"] is not None else float("inf"),
+        item[0],
+    ))
+
+    if len(cases) > 1:
+        render_comparison(cases)
         st.markdown("---")
-        st.subheader("📐 สรุปผลสถิติ & RAO (Steady-State Analysis)")
-
-        t_min, t_max = float(df["Time_s"].min()), float(df["Time_s"].max())
-        default_cutoff = min(50.0, t_max) if t_max > t_min else t_min
-        cutoff = st.slider(
-            "ตัดช่วง Transient เริ่มต้น (คำนวณสถิติ/RAO จากข้อมูลหลังวินาทีที่เลือกเท่านั้น)",
-            min_value=t_min, max_value=t_max, value=default_cutoff,
-            step=max((t_max - t_min) / 100, 0.1) if t_max > t_min else 1.0,
-        )
-
-        df_steady = df[df["Time_s"] > cutoff]
-        df_stats = pd.DataFrame()
-        if df_steady.empty:
-            st.warning("ไม่มีข้อมูลเหลือหลังตัด Transient ลองปรับค่าลง")
-        else:
-            stats_rows = []
-            for col in present_cols:
-                series = df_steady[col].dropna()
-                if series.empty:
-                    continue
-                vmax, vmin = series.max(), series.min()
-                stats_rows.append({
-                    "Parameter": col, "Max": vmax, "Min": vmin,
-                    "Amplitude": (vmax - vmin) / 2, "Mean": series.mean(),
-                })
-            df_stats = pd.DataFrame(stats_rows)
-
-            if has_wave and has_heave:
-                wave_amp = df_stats.loc[df_stats["Parameter"] == "Wave_m", "Amplitude"]
-                heave_amp = df_stats.loc[df_stats["Parameter"] == "Heave_m", "Amplitude"]
-                if len(wave_amp) and len(heave_amp) and wave_amp.iloc[0] != 0:
-                    rao = heave_amp.iloc[0] / wave_amp.iloc[0]
-                    col_a, col_b = st.columns(2)
-                    col_a.metric("RAO (Heave/Wave)", f"{rao:.3f}")
-                    if result["h_value"] and heave_amp.iloc[0] != 0:
-                        hs_ratio = result["h_value"] / heave_amp.iloc[0]
-                        col_b.metric("Hs / Heave Amplitude", f"{hs_ratio:.3f}")
-
-            st.dataframe(
-                df_stats.style.format({"Max": "{:.4f}", "Min": "{:.4f}", "Amplitude": "{:.4f}", "Mean": "{:.4f}"}),
-                use_container_width=True,
-            )
-
-        # ==========================================
-        # ส่งออก Excel
-        # ==========================================
-        st.markdown("---")
-        st.subheader("📥 ส่งออกข้อมูล (Export to Excel)")
-
-        excel_bytes = build_excel_bytes(
-            df, df_stats, condition_text, result["sheet_data"], result["sheet_plot"],
-            has_wave, has_heave, tension_cols, rot_cols,
-        )
-        st.download_button(
-            label="💾 Download Results (.xlsx)",
-            data=excel_bytes,
-            file_name=result["dl_filename"],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+        st.subheader("📂 รายละเอียดแต่ละเคส")
+        tabs = st.tabs([fname for fname, _ in cases])
+        for tab, (fname, result) in zip(tabs, cases):
+            with tab:
+                render_case(fname, result, key_suffix=fname)
+    else:
+        fname, result = cases[0]
+        render_case(fname, result, key_suffix=fname)
