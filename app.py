@@ -1,5 +1,6 @@
 import io
 import re
+import zipfile
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -478,6 +479,7 @@ def render_comparison(cases):
     )
 
     summary_rows = []
+    case_excels = []
     for fname, result in cases:
         df = result["df"]
         present_cols = [c for c in df.columns if c != "Time_s"]
@@ -499,6 +501,15 @@ def render_comparison(cases):
             if param.startswith("Tension"):
                 row[f"Max {param}"] = max_val
         summary_rows.append(row)
+
+        tension_cols = [c for c in df.columns if c.startswith("Tension")]
+        rot_cols = [c for c in ["RX_deg", "RY_deg", "RZ_deg"] if c in df.columns]
+        has_wave, has_heave = "Wave_m" in df.columns, "Heave_m" in df.columns
+        excel_bytes = build_excel_bytes(
+            df, df_stats, result["condition_text"], result["sheet_data"], result["sheet_plot"],
+            has_wave, has_heave, tension_cols, rot_cols,
+        )
+        case_excels.append((result["dl_filename"], excel_bytes))
 
     df_summary = pd.DataFrame(summary_rows).sort_values(
         by=[c for c in ["H", "T"] if c in summary_rows[0]] or ["File"], na_position="last"
@@ -525,12 +536,36 @@ def render_comparison(cases):
         )
         st.plotly_chart(fig, use_container_width=True, key="comparison_rao_chart")
 
-    st.download_button(
+    col_a, col_b = st.columns(2)
+    col_a.download_button(
         "💾 Download Comparison Summary (.csv)",
         data=df_summary.to_csv(index=False).encode("utf-8-sig"),
         file_name="AQWA_Comparison_Summary.csv",
         mime="text/csv",
         key="download_comparison",
+    )
+
+    zip_buffer = io.BytesIO()
+    used_names = set()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("AQWA_Comparison_Summary.csv", df_summary.to_csv(index=False).encode("utf-8-sig"))
+        for dl_filename, excel_bytes in case_excels:
+            name = dl_filename
+            n = 2
+            while name in used_names:
+                stem, ext = dl_filename.rsplit(".", 1)
+                name = f"{stem}_{n}.{ext}"
+                n += 1
+            used_names.add(name)
+            zf.writestr(name, excel_bytes)
+
+    col_b.download_button(
+        f"📦 Download All {len(case_excels)} Cases (.zip)",
+        data=zip_buffer.getvalue(),
+        file_name="AQWA_All_Cases.zip",
+        mime="application/zip",
+        key="download_all_zip",
+        type="primary",
     )
 
 
