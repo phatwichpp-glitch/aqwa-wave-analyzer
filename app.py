@@ -22,6 +22,10 @@ TENSION_COLORS = ["#800000", "#B8860B", "#4B0082", "#006400", "#2F4F4F", "#C7158
 
 def classify(text_lower):
     """Map a metadata description or column header to a standard quantity name."""
+    if "sling" in text_lower and "top" in text_lower:
+        return "Tension_Top_N"
+    if "sling" in text_lower and ("bottom" in text_lower or "buttom" in text_lower):
+        return "Tension_Bottom_N"
     if "wave" in text_lower:
         return "Wave_m"
     if "global z" in text_lower or "heave" in text_lower:
@@ -102,10 +106,15 @@ def _parse_aqwa(file_bytes, filename):
         classified_cols.append((col, category))
 
     tension_total = sum(1 for _, cat in classified_cols if cat == "Tension_N")
+    sling_labels = {"Tension_Top_N": "Tension_Top", "Tension_Bottom_N": "Tension_Bottom"}
+    sling_totals = {
+        cat: sum(1 for _, c in classified_cols if c == cat) for cat in sling_labels
+    }
 
     df_merged = pd.DataFrame()
     rename_report = []
     tension_idx = 0
+    sling_idx = {cat: 0 for cat in sling_labels}
     for col, category in classified_cols:
         if category is None:
             rename_report.append((col, None))
@@ -117,6 +126,14 @@ def _parse_aqwa(file_bytes, filename):
             col_lower = col.lower()
             values = df_raw[col] if "kn" in col_lower else df_raw[col] / 1000.0
             name = "Tension_kN" if tension_total <= 1 else f"Tension_{tension_idx}_kN"
+            df_merged[name] = values
+            category = name
+        elif category in sling_labels:
+            sling_idx[category] += 1
+            col_lower = col.lower()
+            values = df_raw[col] if "kn" in col_lower else df_raw[col] / 1000.0
+            base = sling_labels[category]
+            name = f"{base}_kN" if sling_totals[category] <= 1 else f"{base}_{sling_idx[category]}_kN"
             df_merged[name] = values
             category = name
         else:
